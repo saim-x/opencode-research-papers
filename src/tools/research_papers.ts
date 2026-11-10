@@ -1,8 +1,11 @@
 import { tool, type ToolDefinition } from "@opencode-ai/plugin";
-import type { PaperResult, PluginOptions } from "../types.js";
+import type { PaperResult, PluginOptions, ResearchPapersInput } from "../types.js";
 import { searchArxiv } from "../sources/arxiv.js";
 import { searchOpenAlex } from "../sources/openalex.js";
 import { formatResults } from "../formatters/markdown.js";
+
+export const RESEARCH_PAPERS_DESCRIPTION =
+  "Search for latest, trending, or top-cited research papers on a topic from arXiv and OpenAlex. Returns a formatted list with titles, authors, dates, PDF links, and citation counts. For best recall, expand acronyms and abbreviations in the user's request into the full technical terms used in paper titles and abstracts (e.g., 'MTP in LLMs' should be passed as 'Multi-Token Prediction in Large Language Models').";
 
 let lastArxivRequest = 0;
 const ARXIV_COOLDOWN_MS = 3100;
@@ -21,105 +24,112 @@ async function throttledSearchArxiv(
 }
 
 export function createResearchPapersTool(options: PluginOptions = {}): ToolDefinition {
-  const defaultMaxResults = options.defaultMaxResults ?? 10;
-  const defaultSource = options.defaultSource ?? "auto";
-
   return tool({
-    description:
-      "Search for latest, trending, or top-cited research papers on a topic from arXiv and OpenAlex. Returns a formatted list with titles, authors, dates, PDF links, and citation counts. For best recall, expand acronyms and abbreviations in the user's request into the full technical terms used in paper titles and abstracts (e.g., 'MTP in LLMs' should be passed as 'Multi-Token Prediction in Large Language Models').",
+    description: RESEARCH_PAPERS_DESCRIPTION,
     args: {
       query: tool.schema.string().describe("The research field or topic using full technical terms. Expand acronyms and abbreviations (e.g., 'Multi-Token Prediction in Large Language Models' instead of 'MTP in LLMs')."),
-      source: tool.schema.enum(["arxiv", "openalex", "semantic_scholar", "auto"]).default(defaultSource).describe("Which source(s) to query. 'semantic_scholar' is a deprecated alias for 'openalex'."),
+      source: tool.schema.enum(["arxiv", "openalex", "semantic_scholar", "auto"]).default(options.defaultSource ?? "auto").describe("Which source(s) to query. 'semantic_scholar' is a deprecated alias for 'openalex'."),
       filter: tool.schema.enum(["latest", "trending", "top_cited"]).default("latest").describe("Sorting/filtering strategy"),
-      max_results: tool.schema.number().min(1).max(50).default(defaultMaxResults).describe("Maximum number of papers to return"),
+      max_results: tool.schema.number().min(1).max(50).default(options.defaultMaxResults ?? 10).describe("Maximum number of papers to return"),
       date_range: tool.schema.enum(["week", "month", "year", "all"]).optional().describe("Restrict results to a time window"),
       strict: tool.schema.boolean().default(false).describe("When true, applies anchor + concept-group filtering to reduce loosely matched results."),
     },
-    execute: async (args, _context) => {
-      const maxResults = args.max_results;
-      const dateRange = args.date_range ?? "all";
-      const fetchMultiplier = dateRange !== "all" ? 3 : 1;
-      const normalizedSource = normalizeSource(args.source);
-      const routing = resolveRouting(normalizedSource, args.filter);
-
-      let arxivResults: PaperResult[] = [];
-      let oaResults: PaperResult[] = [];
-      let arxivError: string | null = null;
-      let oaError: string | null = null;
-
-      if (routing.useArxiv && routing.useOpenAlex) {
-        // Fetch both sources in parallel
-        const [arxivResult, oaResult] = await Promise.allSettled([
-          (async () => {
-            const sortBy = args.filter === "latest" ? "submittedDate" : "lastUpdatedDate";
-            return throttledSearchArxiv(args.query, maxResults * fetchMultiplier, sortBy);
-          })(),
-          (async () => {
-            const oaSort = args.filter === "top_cited" || args.filter === "trending"
-              ? "top_cited"
-              : "latest";
-            const oaYear = dateRange === "year" ? yearParam() : undefined;
-            return searchOpenAlex(args.query, maxResults, oaSort, oaYear);
-          })(),
-        ]);
-
-        if (arxivResult.status === "fulfilled") {
-          arxivResults = arxivResult.value;
-        } else {
-          arxivError = arxivResult.reason instanceof Error ? arxivResult.reason.message : String(arxivResult.reason);
-        }
-
-        if (oaResult.status === "fulfilled") {
-          oaResults = oaResult.value;
-        } else {
-          oaError = oaResult.reason instanceof Error ? oaResult.reason.message : String(oaResult.reason);
-        }
-      } else if (routing.useArxiv) {
-        try {
-          const sortBy = args.filter === "latest" ? "submittedDate" : "lastUpdatedDate";
-          arxivResults = await throttledSearchArxiv(args.query, maxResults * fetchMultiplier, sortBy);
-        } catch (err) {
-          arxivError = err instanceof Error ? err.message : String(err);
-        }
-      } else if (routing.useOpenAlex) {
-        try {
-          const oaSort = args.filter === "top_cited" || args.filter === "trending"
-            ? "top_cited"
-            : "latest";
-          const oaYear = dateRange === "year" ? yearParam() : undefined;
-          oaResults = await searchOpenAlex(args.query, maxResults, oaSort, oaYear);
-        } catch (err) {
-          oaError = err instanceof Error ? err.message : String(err);
-        }
-      }
-
-      if (dateRange !== "all") {
-        arxivResults = filterByDateRange(arxivResults, dateRange);
-        oaResults = filterByDateRange(oaResults, dateRange);
-      }
-
-      annotateMatches(arxivResults, args.query);
-      annotateMatches(oaResults, args.query);
-
-      if (args.strict) {
-        arxivResults = strictFilter(arxivResults, args.query);
-        oaResults = strictFilter(oaResults, args.query);
-      }
-
-      const merged = mergeAndDeduplicate(arxivResults, oaResults, routing);
-      const limited = merged.slice(0, maxResults);
-
-      const sourcesUsed = describeSources(arxivResults, oaResults, routing, arxivError, oaError);
-      let output = formatResults(args.query, args.filter, limited, dateRange, sourcesUsed);
-
-      const warnings = buildWarnings(arxivError, oaError, routing, limited.length, normalizedSource, args.source);
-      if (warnings) {
-        output += warnings;
-      }
-
-      return output;
-    },
+    execute: async (args, _context) => runResearchPapers(args, options),
   });
+}
+
+// Shared execution core for the V1 tool and the V2 tool definition. Defaults
+// are normalized here so both entrypoints behave identically whether or not
+// the host applies schema defaults.
+export async function runResearchPapers(
+  args: ResearchPapersInput,
+  options: PluginOptions = {}
+): Promise<string> {
+  const maxResults = args.max_results ?? options.defaultMaxResults ?? 10;
+  const source = args.source ?? options.defaultSource ?? "auto";
+  const filter = args.filter ?? "latest";
+  const strict = args.strict ?? false;
+  const dateRange = args.date_range ?? "all";
+  const fetchMultiplier = dateRange !== "all" ? 3 : 1;
+  const normalizedSource = normalizeSource(source);
+  const routing = resolveRouting(normalizedSource, filter);
+
+  let arxivResults: PaperResult[] = [];
+  let oaResults: PaperResult[] = [];
+  let arxivError: string | null = null;
+  let oaError: string | null = null;
+
+  if (routing.useArxiv && routing.useOpenAlex) {
+    // Fetch both sources in parallel
+    const [arxivResult, oaResult] = await Promise.allSettled([
+      (async () => {
+        const sortBy = filter === "latest" ? "submittedDate" : "lastUpdatedDate";
+        return throttledSearchArxiv(args.query, maxResults * fetchMultiplier, sortBy);
+      })(),
+      (async () => {
+        const oaSort = filter === "top_cited" || filter === "trending"
+          ? "top_cited"
+          : "latest";
+        const oaYear = dateRange === "year" ? yearParam() : undefined;
+        return searchOpenAlex(args.query, maxResults, oaSort, oaYear);
+      })(),
+    ]);
+
+    if (arxivResult.status === "fulfilled") {
+      arxivResults = arxivResult.value;
+    } else {
+      arxivError = arxivResult.reason instanceof Error ? arxivResult.reason.message : String(arxivResult.reason);
+    }
+
+    if (oaResult.status === "fulfilled") {
+      oaResults = oaResult.value;
+    } else {
+      oaError = oaResult.reason instanceof Error ? oaResult.reason.message : String(oaResult.reason);
+    }
+  } else if (routing.useArxiv) {
+    try {
+      const sortBy = filter === "latest" ? "submittedDate" : "lastUpdatedDate";
+      arxivResults = await throttledSearchArxiv(args.query, maxResults * fetchMultiplier, sortBy);
+    } catch (err) {
+      arxivError = err instanceof Error ? err.message : String(err);
+    }
+  } else if (routing.useOpenAlex) {
+    try {
+      const oaSort = filter === "top_cited" || filter === "trending"
+        ? "top_cited"
+        : "latest";
+      const oaYear = dateRange === "year" ? yearParam() : undefined;
+      oaResults = await searchOpenAlex(args.query, maxResults, oaSort, oaYear);
+    } catch (err) {
+      oaError = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  if (dateRange !== "all") {
+    arxivResults = filterByDateRange(arxivResults, dateRange);
+    oaResults = filterByDateRange(oaResults, dateRange);
+  }
+
+  annotateMatches(arxivResults, args.query);
+  annotateMatches(oaResults, args.query);
+
+  if (strict) {
+    arxivResults = strictFilter(arxivResults, args.query);
+    oaResults = strictFilter(oaResults, args.query);
+  }
+
+  const merged = mergeAndDeduplicate(arxivResults, oaResults, routing);
+  const limited = merged.slice(0, maxResults);
+
+  const sourcesUsed = describeSources(arxivResults, oaResults, routing, arxivError, oaError);
+  let output = formatResults(args.query, filter, limited, dateRange, sourcesUsed);
+
+  const warnings = buildWarnings(arxivError, oaError, routing, limited.length, normalizedSource, source);
+  if (warnings) {
+    output += warnings;
+  }
+
+  return output;
 }
 
 type Routing = { useArxiv: boolean; useOpenAlex: boolean; arxivFirst: boolean };

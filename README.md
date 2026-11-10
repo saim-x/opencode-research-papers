@@ -36,6 +36,26 @@ Add this to your `opencode.json`:
 
 Restart opencode. The tool registers automatically.
 
+### OpenCode v2
+
+This plugin supports both plugin APIs from one package. On OpenCode v2 it
+exports a `Plugin.define` entrypoint (id `opencode-research-papers`) and
+registers the same `research_papers` tool through the v2 tool transform API
+(JSON Schema input, structured content output); configure it under the
+`plugins` key:
+
+```json
+{
+  "plugins": [
+    "opencode-research-papers"
+  ]
+}
+```
+
+On OpenCode 1.x it keeps the legacy function entrypoint under the `plugin`
+key. The combined entrypoint shape requires OpenCode 1.18.29 or newer for
+1.x hosts — older 1.x releases should stay on plugin version 1.4.8.
+
 ### Updating
 
 OpenCode caches plugin packages and does not auto-update on restart. After updating to a new version, clear the cache before restarting:

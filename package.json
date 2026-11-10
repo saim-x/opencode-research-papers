@@ -36,6 +36,7 @@
   "homepage": "https://github.com/saim-x/opencode-research-papers#readme",
   "dependencies": {
     "@opencode-ai/plugin": "^1.15.10",
+    "@opencode/plugin": "^2.0.0",
     "fast-xml-parser": "^5.2.5"
   },
   "devDependencies": {
